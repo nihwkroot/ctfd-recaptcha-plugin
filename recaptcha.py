@@ -3,8 +3,8 @@ from functools import wraps
 from .config import config
 from lxml import etree
 import logging
-import requests
 import json
+from six.moves import urllib
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -27,17 +27,26 @@ def load(app):
         # in which case they will turn off the automatic insert feature
         for form in root.iter('form'):
             for child in form.iterchildren():
-                for button in child.xpath('.//button[@type="submit"]'):
+                for button in child.xpath('.//button[@id="submit"]'):
                     button.addprevious(
                         etree.Element('div',
                             attrib = {
                                 'class': 'g-recaptcha float-left',
-                                'data-sitekey': app.config['RECAPTCHA_SITE_KEY']
+                                'data-sitekey': app.config['RECAPTCHA_SITE_KEY'],
+                                'data-callback': 'onSubmit',
+                                'data-size': 'invisible'
                             }
                         )
                     )
 
         for head in root.iter('head'):
+            submit = etree.Element('script')
+            submit.text = "function onSubmit(token) {\
+                console.log(token);\
+                $('#g-recaptcha-response').text(token);\
+                console.log($('form'));\
+                $('form:first').submit();}"
+            head.append(submit)
             head.append(etree.Element('script',
                 attrib = {
                     'src': 'https://www.google.com/recaptcha/api.js',
@@ -45,6 +54,14 @@ def load(app):
                     'defer': 'true'
                 }
             ))
+
+        for body in root.iter('body'):
+            js = etree.Element('script')
+            js.text = " $('#submit').attr('id', 'timbus');\
+                        $('#timbus').prop('type', 'button');\
+                        $('#timbus').click(function(event) {console.log('submit click');grecaptcha.execute();});"
+            body.append(js)
+            
 
 
         return etree.tostring(root, method='html')
@@ -62,53 +79,79 @@ def load(app):
 
         return wrapper
 
+    def recaptcha():
+        errors = []
+        bad_request = False
+        if 'g-recaptcha-response' in request.form and request.form['g-recaptcha-response']:
+            params = {
+                'secret': app.config['RECAPTCHA_SECRET'],
+                'response': request.form['g-recaptcha-response'],
+                'remoteip':  request.remote_addr
+            }
+            request_url = app.config['RECAPTCHA_VERIFY_URL'].format(**params)
+            verify_response = urllib.request.urlopen(request_url)
+            logging.debug("Sending reCaptcha verification request: {}".format(request_url))
+
+            if verify_response.getcode() == 200:
+                verify = json.loads(verify_response.read())
+                logging.debug("Got reCaptcha response: {}".format(verify))
+                if 'error-codes' in verify and verify['error-codes']:
+                    bad_request = True
+                    logging.error("Google reCaptcha returned error codes {}".format(verify['error-codes']))
+                elif verify['success']:
+                    logging.debug("{} is human".format(request.form['name']))
+                    return True, []
+            else:
+                bad_request = True
+                logging.error("Google reCaptcha request failed with code {}".format(verify_response.getcode()))
+
+        if bad_request:
+            errors.append("Google reCaptcha is currently unavailable. Please try again later")
+        else:
+            errors.append("Please click button to verify you are human, flag{n0_r0b0t_0nly_human_can_PASS!!}")
+        return False, []
+
+    def auth_decorator(auth_fun):
+        @wraps(auth_fun)
+        def wrapper(*args, **kwargs):
+            if not app.config['RECAPTCHA_INSERT_TAGS']:
+                return auth_fun(*args, **kwargs)
+            if request.method == 'POST':
+                result, errors = recaptcha()
+                if result == True:
+                    return auth_fun(*args, **kwargs)
+                else:
+                    return render_template('login.html')
+            else:
+                return auth_fun(*args, **kwargs)
+                
+        return wrapper
+
     def register_decorator(register_func):
         @wraps(register_func)
         def wrapper(*args, **kwargs):
+            if not app.config['RECAPTCHA_INSERT_TAGS']:
+                return register_func(*args, **kwargs)
             if request.method == 'POST':
-                errors = []
-                bad_request = False
-                if 'g-recaptcha-response' in request.form and request.form['g-recaptcha-response']:
-                    params = {
-                        'secret': app.config['RECAPTCHA_SECRET'],
-                        'response': request.form['g-recaptcha-response'],
-                        'remoteip':  request.remote_addr
-                    }
-                    request_url = app.config['RECAPTCHA_VERIFY_URL'].format(**params)
-                    verify_reponse = requests.post(request_url)
-                    logging.debug("Sending reCaptcha verification request: {}".format(request_url))
-
-                    if verify_reponse.ok:
-                        verify =  json.loads(verify_reponse.text)
-                        logging.debug("Got reCaptcha response: {}".format(verify))
-                        if 'error-codes' in verify and verify['error-codes']:
-                            bad_request = True
-                            logging.error("Google reCaptcha returned error codes {}".format(verify['error-codes']))
-                        elif verify['success']:
-                            logging.debug("{} is human".format(request.form['name']))
-                            return register_func(*args, **kwargs)
-                    else:
-                        bad_request = True
-                        logging.error("Google reCaptcha request failed with code {}".format(verify_response.status_code))
-
-                if bad_request:
-                    errors.append("Google reCaptcha is currently unavailable. Please try again later")
+                result, errors = recaptcha()
+                if result == True:
+                    return register_func(*args, **kwargs)
                 else:
-                    errors.append("Please check the reCaptcha box to verify you are human")
-
-                return render_template(
-                    'register.html',
-                    errors=errors,
-                    name=request.form['name'],
-                    email=request.form['email'],
-                    password=request.form['password']
-                )
+                    return render_template(
+                        'register.html',
+                        errors=errors,
+                        name=request.form['name'],
+                        email=request.form['email'],
+                        password=request.form['password']
+                    )
             else:
                 return register_func(*args, **kwargs)
 
         return wrapper
 
     app.view_functions['auth.register'] = register_decorator(app.view_functions['auth.register'])
+    app.view_functions['auth.login'] = auth_decorator(app.view_functions['auth.login'])
 
     if app.config['RECAPTCHA_INSERT_TAGS']:
         app.view_functions['auth.register'] = insert_tags_decorator(app.view_functions['auth.register'])
+        app.view_functions['auth.login'] = insert_tags_decorator(app.view_functions['auth.login'])

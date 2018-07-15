@@ -1,2 +1,2 @@
-requests
-lxml
+six==1.11.0
+lxml==4.2.3

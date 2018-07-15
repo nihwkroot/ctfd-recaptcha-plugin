@@ -26,7 +26,7 @@ def config(app):
     '''
     app.config['RECAPTCHA_INSERT_TAGS'] = True
 
-
+    
     if VERIFY_REMOTE_IP:
         app.config['RECAPTCHA_VERIFY_URL'] = 'https://www.google.com/recaptcha/api/siteverify?secret={secret:s}&response={response:s}&remoteip={remoteip:s}'
     else:
